@@ -310,6 +310,10 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
         status TEXT DEFAULT "pending", created_at TEXT)''')
     c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+    # شمارنده‌ی حجم فروخته‌شده (برای سقف فروش؛ با حذف کانفیگ کم نمی‌شه). بار اول از کانفیگ‌های موجود پر می‌شه.
+    c.execute("SELECT 1 FROM settings WHERE key='lic_sold_gb'")
+    if c.fetchone() is None:
+        c.execute("INSERT INTO settings (key, value) SELECT 'lic_sold_gb', CAST(COALESCE(SUM(gb), 0) AS TEXT) FROM user_configs")
     for col in ('ALTER TABLE users ADD COLUMN username TEXT', 'ALTER TABLE users ADD COLUMN first_name TEXT',
                 'ALTER TABLE users ADD COLUMN joined_at TEXT',
                 "ALTER TABLE topup_requests ADD COLUMN method TEXT DEFAULT 'card'",
@@ -544,6 +548,86 @@ def day_step():
 
 
 # (کلید، عنوان، نوع) — همین‌ها تو پنل ادمین قابل‌ویرایشن
+# ---------------------------------------------------------------------------
+# لایسنس: قفل‌ها و محدودیت‌هایی که فقط از «ربات مدیریت (Master)» عوض می‌شن
+# (از پنل ادمین همین بات هیچ‌جوری قابل تغییر نیستن)
+# ---------------------------------------------------------------------------
+LIC_DEFAULT_MSG = '⛔ این ربات فعلاً غیرفعاله. برای فعال‌سازی با پشتیبانی تماس بگیر.'
+LIC_EXPIRED_MSG = '⌛ اعتبار این ربات تموم شده. برای تمدید با پشتیبانی تماس بگیر.'
+
+
+def lic_on(key):
+    return get_setting(key, '1') != '0'
+
+
+def lic_blocked():
+    """متن پیام اگه ربات متوقف یا منقضی شده؛ وگرنه None."""
+    if get_setting('lic_active', '1') == '0':
+        return get_setting('lic_msg', LIC_DEFAULT_MSG)
+    exp = get_setting('lic_expires', '')
+    if exp and exp < datetime.now().strftime('%Y-%m-%d'):
+        return LIC_EXPIRED_MSG
+    return None
+
+
+def lic_min_gb():
+    return max(1, _int(get_setting('lic_min_gb', '1'), 1))
+
+
+def lic_max_gb():
+    return max(lic_min_gb(), _int(get_setting('lic_max_gb', '1000'), 1000))
+
+
+def lic_max_days():
+    return max(1, _int(get_setting('lic_max_days', '365'), 365))
+
+
+def _fnum(v, d=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return d
+
+
+@with_db_retry
+def quota_info():
+    """(سقف کل یا None برای نامحدود، حجم فروخته‌شده) — مستقیم از دیتابیس."""
+    c = get_conn().cursor()
+    c.execute("SELECT key, value FROM settings WHERE key IN ('lic_quota_gb', 'lic_sold_gb')")
+    d = {r[0]: r[1] for r in c.fetchall()}
+    q = d.get('lic_quota_gb')
+    quota = None if q is None or str(q).strip() == '' else _fnum(q)
+    return quota, _fnum(d.get('lic_sold_gb'))
+
+
+@with_db_retry
+def quota_reserve(gb):
+    """رزرو اتمیکِ حجم برای فروش. False یعنی ظرفیت کافی نیست."""
+    quota, _sold = quota_info()
+    conn = get_conn()
+    c = conn.cursor()
+    if quota is None:
+        c.execute("INSERT INTO settings (key, value) VALUES ('lic_sold_gb', ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS REAL) + ? AS TEXT)", (str(gb), gb))
+        conn.commit()
+        return True
+    return _claim(c, conn, "UPDATE settings SET value=CAST(CAST(value AS REAL) + ? AS TEXT) "
+                           "WHERE key='lic_sold_gb' AND CAST(value AS REAL) + ? <= ?", (gb, gb, quota + 1e-9))
+
+
+@with_db_retry
+def quota_release(gb):
+    conn = get_conn()
+    conn.cursor().execute("UPDATE settings SET value=CAST(MAX(0, CAST(value AS REAL) - ?) AS TEXT) "
+                          "WHERE key='lic_sold_gb'", (gb,))
+    conn.commit()
+
+
+def quota_left():
+    quota, sold = quota_info()
+    return None if quota is None else max(quota - sold, 0.0)
+
+
 SETTING_META = (
     ('card_number', '💳 شماره کارت', 'text'),
     ('card_owner', '👤 نام صاحب کارت', 'text'),
@@ -724,7 +808,7 @@ def send_menu(chat_id, note=None):
 # ۱) شارژ کیف پول (کارت‌به‌کارت + تایید دستی ادمین)
 # ---------------------------------------------------------------------------
 def topup_start(chat_id):
-    if not card_number():
+    if not card_number() or not lic_on('lic_topup'):
         send_message(chat_id, '⚠️ شارژ کیف پول فعلاً در دسترس نیست.', back_kb())
         return
     user_steps[chat_id] = {'step': 'topup_amount'}
@@ -850,10 +934,11 @@ def qty_screen(chat_id, st):
 
 
 def buy_start(chat_id):
-    if not CONFIG_API or not CONFIG_KEY:
+    if not CONFIG_API or not CONFIG_KEY or not lic_on('lic_buy'):
         send_message(chat_id, '⚠️ خرید فعلاً در دسترس نیست.', back_kb())
         return
-    st = {'step': 'buy_qty', 'gb': default_gb(), 'days': default_days()}
+    st = {'step': 'buy_qty', 'gb': min(max(default_gb(), lic_min_gb()), lic_max_gb()),
+          'days': min(default_days(), lic_max_days())}
     user_steps[chat_id] = st
     text, kb = qty_screen(chat_id, st)
     send_message(chat_id, text, kb)
@@ -864,13 +949,13 @@ def buy_qty_change(chat_id, message_id, action):
     if st.get('step') != 'buy_qty':
         return
     if action == 'gb-':
-        st['gb'] = max(1, st['gb'] - gb_step())
+        st['gb'] = max(lic_min_gb(), st['gb'] - gb_step())
     elif action == 'gb+':
-        st['gb'] = min(1000, st['gb'] + gb_step())
+        st['gb'] = min(lic_max_gb(), st['gb'] + gb_step())
     elif action == 'd-':
         st['days'] = max(1, st['days'] - day_step())
     elif action == 'd+':
-        st['days'] = min(365, st['days'] + day_step())
+        st['days'] = min(lic_max_days(), st['days'] + day_step())
     text, kb = qty_screen(chat_id, st)
     edit_message(chat_id, message_id, text, kb)
 
@@ -878,6 +963,11 @@ def buy_qty_change(chat_id, message_id, action):
 def buy_ask_label(chat_id):
     st = user_steps.get(chat_id) or {}
     if st.get('step') != 'buy_qty':
+        return
+    left = quota_left()
+    if left is not None and left < st['gb']:
+        send_message(chat_id, '⚠️ ظرفیت فروش این ربات برای این حجم کافی نیست (باقی‌مانده: %.1f گیگ).\n'
+                              'حجم کمتری انتخاب کن یا بعداً دوباره امتحان کن.' % left, back_kb())
         return
     st['step'] = 'buy_label'
     send_message(chat_id, '✏️ یه اسم برای کانفیگ بفرست (یا «رد کردن» رو بزن):',
@@ -909,7 +999,15 @@ def buy_confirm(chat_id, frm):
         return
     user_steps.pop(chat_id, None)            # جلوگیری از پرداخت دوباره با کلیک تکراری
     price, gb, days, label = st['price'], st['gb'], st['days'], st['label']
+    if not lic_on('lic_buy') or not (lic_min_gb() <= gb <= lic_max_gb()) or days > lic_max_days():
+        send_message(chat_id, '⚠️ این خرید با محدودیت‌های فعلی ربات جور نیست. دوباره از اول انتخاب کن.', back_kb())
+        return
+    if not quota_reserve(gb):
+        left = quota_left() or 0
+        send_message(chat_id, '⚠️ ظرفیت فروش این ربات کافی نیست (باقی‌مانده: %.1f گیگ).' % left, back_kb())
+        return
     if not take_wallet(chat_id, price):
+        quota_release(gb)
         short = price - get_wallet(chat_id)
         send_message(chat_id, '⚠️ موجودیت کافی نیست؛ <b>%s</b> تومان کم داری.' % fmt(max(short, 0)),
                      {'inline_keyboard': [[{'text': '💳 شارژ کیف پول', 'callback_data': 'topup'}],
@@ -918,6 +1016,7 @@ def buy_confirm(chat_id, frm):
     proto = config_proto()
     res = make_config(gb, label, days, proto)
     if not res['success'] or not res.get('sub_url'):
+        quota_release(gb)
         add_wallet(chat_id, price)           # برگردوندن پول
         send_message(chat_id, '⚠️ ساخت کانفیگ انجام نشد و مبلغ به کیف پولت برگشت. کمی بعد دوباره امتحان کن.',
                      back_kb())
@@ -948,6 +1047,15 @@ def admin_panel(chat_id):
     text = ('🛠 <b>پنل ادمین</b>\n%s\n👥 کاربران: <b>%s</b>\n💰 مجموع موجودی کیف‌پول‌ها: <b>%s</b> تومان\n'
             '📦 کانفیگ فروخته‌شده: <b>%s</b>\n💸 مجموع فروش: <b>%s</b> تومان\n⏳ شارژ در انتظار تایید: <b>%s</b>'
             % (DIVIDER, fmt(users), fmt(wallets), fmt(cfgs), fmt(sales), pending))
+    quota, sold = quota_info()
+    if quota is not None:
+        text += '\n📶 ظرفیت باقی‌مانده فروش: <b>%.1f</b> از %.1f گیگ' % (max(quota - sold, 0), quota)
+    exp = get_setting('lic_expires', '')
+    if exp:
+        text += '\n⏳ اعتبار تا: <b>%s</b>' % esc(exp)
+    notice = get_setting('lic_notice', '')
+    if notice:
+        text = '📣 <b>پیام پشتیبانی:</b> %s\n%s\n' % (esc(notice), DIVIDER) + text
     send_message(chat_id, text, {'inline_keyboard': [
         [_btn('⚙️ تنظیمات (کارت، قیمت و ...)', 'ad:set')],
         [_btn('👥 کاربران', 'ad:users:0'), _btn('📦 سفارش‌ها', 'ad:orders:0')],
@@ -1101,6 +1209,8 @@ def admin_callback(chat_id, arg):
         send_message(chat_id, '✉️ متن پیام برای کاربر <code>%s</code> رو بفرست:' % n, _kb([_btn('❌ انصراف', 'ad:u:%s' % n)]))
     elif a == 'uc' and n is not None:
         admin_user_configs(chat_id, n)
+    elif a == 'ug' and n is not None and not lic_on('lic_gift'):
+        send_message(chat_id, '⛔ ساخت کانفیگ هدیه برای این ربات فعال نیست.', _back_panel())
     elif a == 'ug' and n is not None:
         user_steps[chat_id] = {'step': 'admin_gift', 'uid': n}
         send_message(chat_id, '🎁 کانفیگ هدیه برای <code>%s</code>\n\nاین شکلی بفرست: <code>گیگ روز [نام]</code>\n'
@@ -1374,8 +1484,13 @@ def admin_cfg_extend_got(chat_id, text):
     if not row:
         return
     days = int(days)
+    if gb > 0 and not quota_reserve(gb):
+        send_message(chat_id, '⚠️ ظرفیت فروش کافی نیست (باقی‌مانده: %.1f گیگ).' % (quota_left() or 0))
+        return
     r = cfg_call('POST', '/extend', row[3], {'gb': gb, 'days': days})
     if not r['success']:
+        if gb > 0:
+            quota_release(gb)
         send_message(chat_id, '⚠️ تمدید روی پنل ناموفق: <code>%s</code>' % esc(r['error']))
         return
     try:
@@ -1443,9 +1558,16 @@ def admin_gift_got(chat_id, text):
     days = int(days)
     label = re.sub(r'[<>&]', '', ' '.join(parts[2:])).strip()[:40] or 'GIFT-' + secrets.token_hex(3).upper()
     user_steps.pop(chat_id, None)
+    if not lic_on('lic_gift'):
+        send_message(chat_id, '⛔ ساخت کانفیگ هدیه برای این ربات فعال نیست.', _back_panel())
+        return
+    if not quota_reserve(gb):
+        send_message(chat_id, '⚠️ ظرفیت فروش کافی نیست (باقی‌مانده: %.1f گیگ).' % (quota_left() or 0), _back_panel())
+        return
     proto = config_proto()
     res = make_config(gb, label, days, proto)
     if not res['success'] or not res.get('sub_url'):
+        quota_release(gb)
         send_message(chat_id, '⚠️ ساخت کانفیگ ناموفق بود (CONFIG_API / CONFIG_KEY رو چک کن).', _back_panel())
         return
     save_config(uid, res['sub_url'], res['config_id'], gb, label, days, 0, proto)
@@ -1540,6 +1662,9 @@ def broadcast_worker(admin_chat, text, ids):
 
 
 def admin_bcast_start(chat_id):
+    if not lic_on('lic_broadcast'):
+        send_message(chat_id, '⛔ پیام همگانی برای این ربات فعال نیست.', _back_panel())
+        return
     if BROADCAST['running']:
         send_message(chat_id, '⏳ یه ارسال همگانی هنوز در حال انجامه (%s از %s).'
                      % (BROADCAST['sent'] + BROADCAST['failed'], BROADCAST['total']), _back_panel())
@@ -1577,10 +1702,27 @@ def admin_toggle_maintenance(chat_id):
 # ---------------------------------------------------------------------------
 # پردازش آپدیت‌ها
 # ---------------------------------------------------------------------------
+@with_db_retry
+def _user_count_and_exists(uid):
+    c = get_conn().cursor()
+    c.execute('SELECT COUNT(*), COALESCE(SUM(user_id = ?), 0) FROM users', (uid,))
+    n, e = c.fetchone()
+    return int(n or 0), bool(e)
+
+
 def ensure_user(chat_id, frm):
-    if chat_id not in _known_users:
-        upsert_user(chat_id, frm.get('username'), frm.get('first_name'))
-        _known_users.add(chat_id)
+    """False یعنی ظرفیت ثبت‌نام ربات پره و این کاربر جدید پذیرفته نشد."""
+    if chat_id in _known_users:
+        return True
+    mx = _int(get_setting('lic_max_users', ''), 0)
+    if mx and not is_admin(chat_id):
+        n, exists = _user_count_and_exists(chat_id)
+        if not exists and n >= mx:
+            send_message(chat_id, '⚠️ ظرفیت ثبت‌نام این ربات تکمیل شده.')
+            return False
+    upsert_user(chat_id, frm.get('username'), frm.get('first_name'))
+    _known_users.add(chat_id)
+    return True
 
 
 def handle_message(msg):
@@ -1588,7 +1730,12 @@ def handle_message(msg):
     frm = msg.get('from') or {}
     if chat_id is None:
         return
-    ensure_user(chat_id, frm)
+    if not ensure_user(chat_id, frm):
+        return
+    blocked = lic_blocked()
+    if blocked:
+        send_message(chat_id, blocked)
+        return
     if not is_admin(chat_id) and maintenance_on():
         send_message(chat_id, maintenance_text())
         return
@@ -1623,7 +1770,12 @@ def handle_callback(cb):
     frm = cb.get('from') or {}
     if chat_id is None:
         return
-    ensure_user(chat_id, frm)
+    if not ensure_user(chat_id, frm):
+        return
+    blocked = lic_blocked()
+    if blocked:
+        send_message(chat_id, blocked)
+        return
     if not is_admin(chat_id) and maintenance_on():
         send_message(chat_id, maintenance_text())
         return
@@ -1702,9 +1854,27 @@ def start_health_server(port):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
+def _heartbeat_loop():
+    """هر دقیقه زمان فعلی رو تو تنظیمات می‌نویسه تا ربات مدیریت بفهمه این بات آنلاینه."""
+    time.sleep(2)
+    while True:
+        try:
+            set_setting('lic_heartbeat', str(int(time.time())))
+        except Exception as e:
+            print('⚠️ heartbeat ناموفق:', e)
+        time.sleep(60)
+
+
 def main():
     init_db()
     api('deleteWebhook', {'drop_pending_updates': False}, 10)
+    try:
+        me = (api('getMe', {}, 10) or {}).get('result') or {}
+        if me.get('username'):
+            set_setting('lic_username', str(me['username']))
+    except Exception:
+        pass
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     if not ADMIN_ID:
         print('⚠️ ADMIN_ID تنظیم نشده؛ تایید شارژ و دستورهای ادمین کار نمی‌کنن.')
     if os.getenv("DISABLE_HEALTH_SERVER") != "1":
